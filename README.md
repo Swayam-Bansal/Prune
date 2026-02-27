@@ -1,8 +1,6 @@
 # Prune
 
-# 🚀 PreMortem
-
-**External Market Risk Engine for Startup Ideas**
+# **External Market Risk Engine for Startup Ideas**
 
 PreMortem analyzes startup ideas using real external market signals before founders invest time and capital.
 
