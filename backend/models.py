@@ -8,11 +8,15 @@ from typing import Optional
 class StartupInput(BaseModel):
     """What the founder provides."""
     idea: str = Field(..., description="One-line startup idea", min_length=5)
-    problem: str = Field(..., description="The problem being solved", min_length=5)
-    solution: str = Field(..., description="How the product solves it", min_length=5)
+    problem: str = Field(default="", description="The problem being solved")
+    solution: str = Field(default="", description="How the product solves it")
     product_specs: str = Field(
         default="",
         description="Technical details, features, target platform, etc.",
+    )
+    deep_mode: bool = Field(
+        default=False,
+        description="If True, includes Reddit analysis (slower, 2-3 mins)",
     )
 
 

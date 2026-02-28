@@ -17,8 +17,59 @@ HEADERS = {
     "User-Agent": "PreMortem:v1.0 (market research tool)",
 }
 
-# Rate-limit: Reddit allows ~10 req/min for unauthenticated
-RATE_LIMIT_DELAY = 1.5  # seconds between requests
+# Global semaphore: max concurrent Reddit HTTP requests
+# Keeps us well under Reddit's ~60 req/min unauthenticated ceiling
+_REDDIT_SEM: asyncio.Semaphore | None = None
+
+
+def _sem() -> asyncio.Semaphore:
+    global _REDDIT_SEM
+    if _REDDIT_SEM is None:
+        _REDDIT_SEM = asyncio.Semaphore(5)
+    return _REDDIT_SEM
+
+
+async def _fetch_one(
+    client: httpx.AsyncClient,
+    url: str,
+    params: dict,
+    query: str,
+) -> list[dict]:
+    """Single Reddit search request, semaphore-gated."""
+    async with _sem():
+        try:
+            response = await client.get(url, params=params)
+            if response.status_code == 429:
+                retry_after = int(response.headers.get("Retry-After", 3))
+                logger.warning(f"Reddit rate limit hit, waiting {retry_after}s...")
+                await asyncio.sleep(retry_after)
+                response = await client.get(url, params=params)
+            if response.status_code != 200:
+                logger.warning(f"Reddit returned {response.status_code} for {url}")
+                return []
+            posts = response.json().get("data", {}).get("children", [])
+            return [
+                {
+                    "id": p["data"].get("id", ""),
+                    "title": p["data"].get("title", ""),
+                    "selftext": (p["data"].get("selftext", "") or "")[:1500],
+                    "subreddit": p["data"].get("subreddit_name_prefixed", ""),
+                    "score": p["data"].get("score", 0),
+                    "num_comments": p["data"].get("num_comments", 0),
+                    "url": f"https://reddit.com{p['data'].get('permalink', '')}",
+                    "created_utc": p["data"].get("created_utc", 0),
+                    "upvote_ratio": p["data"].get("upvote_ratio", 0),
+                    "source_query": query,
+                }
+                for p in posts
+                if p.get("data", {}).get("id")
+            ]
+        except httpx.TimeoutException:
+            logger.warning(f"Timeout searching Reddit: {url}")
+            return []
+        except Exception as e:
+            logger.warning(f"Error searching Reddit: {e}")
+            return []
 
 
 async def search_reddit(
@@ -30,77 +81,38 @@ async def search_reddit(
 ) -> list[dict]:
     """
     Search Reddit for threads matching the query.
-    If subreddits are provided, searches each one individually and merges results.
-    Otherwise does a global search.
-
-    Returns a list of simplified thread dicts.
+    All search targets (subreddits + global) are fetched concurrently.
+    Returns a deduplicated list of thread dicts.
     """
-    all_threads = []
+    if subreddits:
+        search_targets = [
+            (REDDIT_SUBREDDIT_SEARCH_URL.format(subreddit=sub.replace("r/", "")), sub)
+            for sub in subreddits[:3]
+        ]
+        search_targets.append((REDDIT_SEARCH_URL, "all"))
+    else:
+        search_targets = [(REDDIT_SEARCH_URL, "all")]
+
+    base_params = {"limit": min(limit, 25), "sort": sort, "t": time_filter, "type": "link"}
 
     async with httpx.AsyncClient(headers=HEADERS, timeout=15.0) as client:
-        if subreddits:
-            # Search specific subreddits + global
-            search_targets = [
-                (REDDIT_SUBREDDIT_SEARCH_URL.format(
-                    subreddit=sub.replace("r/", "")), sub)
-                for sub in subreddits[:3]  # cap at 3 subreddits per query
-            ]
-            # Also add global search
-            search_targets.append((REDDIT_SEARCH_URL, "all"))
-        else:
-            search_targets = [(REDDIT_SEARCH_URL, "all")]
+        results = await asyncio.gather(*[
+            _fetch_one(
+                client,
+                url,
+                {**base_params, "q": query, "restrict_sr": "on" if source != "all" else "off"},
+                query,
+            )
+            for url, source in search_targets
+        ])
 
-        for url, source in search_targets:
-            try:
-                params = {
-                    "q": query,
-                    "limit": min(limit, 25),
-                    "sort": sort,
-                    "t": time_filter,
-                    "restrict_sr": "on" if source != "all" else "off",
-                    "type": "link",
-                }
-                response = await client.get(url, params=params)
-
-                if response.status_code == 429:
-                    logger.warning("Reddit rate limit hit, waiting 5s...")
-                    await asyncio.sleep(5)
-                    response = await client.get(url, params=params)
-
-                if response.status_code != 200:
-                    logger.warning(
-                        f"Reddit returned {response.status_code} for {url}")
-                    continue
-
-                data = response.json()
-                posts = data.get("data", {}).get("children", [])
-
-                for post in posts:
-                    p = post.get("data", {})
-                    thread = {
-                        "id": p.get("id", ""),
-                        "title": p.get("title", ""),
-                        # truncate long posts
-                        "selftext": (p.get("selftext", "") or "")[:1500],
-                        "subreddit": p.get("subreddit_name_prefixed", ""),
-                        "score": p.get("score", 0),
-                        "num_comments": p.get("num_comments", 0),
-                        "url": f"https://reddit.com{p.get('permalink', '')}",
-                        "created_utc": p.get("created_utc", 0),
-                        "upvote_ratio": p.get("upvote_ratio", 0),
-                        "source_query": query,
-                    }
-                    # Dedupe by id
-                    if thread["id"] and thread["id"] not in {t["id"] for t in all_threads}:
-                        all_threads.append(thread)
-
-                await asyncio.sleep(RATE_LIMIT_DELAY)
-
-            except httpx.TimeoutException:
-                logger.warning(f"Timeout searching Reddit: {url}")
-            except Exception as e:
-                logger.warning(f"Error searching Reddit: {e}")
-
+    seen: set[str] = set()
+    all_threads: list[dict] = []
+    for batch in results:
+        for t in batch:
+            if t["id"] not in seen:
+                seen.add(t["id"])
+                all_threads.append(t)
     return all_threads
 
 
@@ -110,28 +122,23 @@ async def fetch_thread_comments(thread_url: str, limit: int = 10) -> list[str]:
     Returns a list of comment body strings.
     """
     json_url = thread_url.rstrip("/") + ".json"
-
-    async with httpx.AsyncClient(headers=HEADERS, timeout=15.0) as client:
-        try:
-            response = await client.get(json_url, params={"limit": limit, "sort": "top"})
-            if response.status_code != 200:
+    async with _sem():
+        async with httpx.AsyncClient(headers=HEADERS, timeout=15.0) as client:
+            try:
+                response = await client.get(json_url, params={"limit": limit, "sort": "top"})
+                if response.status_code != 200:
+                    return []
+                data = response.json()
+                if len(data) < 2:
+                    return []
+                comments = []
+                for c in data[1].get("data", {}).get("children", []):
+                    body = c.get("data", {}).get("body", "")
+                    if body and body not in ("[deleted]", "[removed]"):
+                        comments.append(body[:500])
+                        if len(comments) >= limit:
+                            break
+                return comments
+            except Exception as e:
+                logger.warning(f"Error fetching comments: {e}")
                 return []
-
-            data = response.json()
-            if len(data) < 2:
-                return []
-
-            comments = []
-            comment_listing = data[1].get("data", {}).get("children", [])
-            for c in comment_listing:
-                body = c.get("data", {}).get("body", "")
-                if body and body != "[deleted]" and body != "[removed]":
-                    comments.append(body[:500])  # truncate long comments
-                    if len(comments) >= limit:
-                        break
-
-            return comments
-
-        except Exception as e:
-            logger.warning(f"Error fetching comments: {e}")
-            return []

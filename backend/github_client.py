@@ -114,13 +114,13 @@ def build_github_query(keywords: List[str]) -> str:
 # ---------------------------------------------------------------------------
 
 def search_github(query: str) -> dict:
-    """Search GitHub repositories for the given query string."""
+    """Search GitHub repositories for the given query string (up to 100 results)."""
     headers = {"Accept": "application/vnd.github+json"}
     token = os.getenv("GITHUB_TOKEN")
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
-    params = {"q": query, "per_page": 30, "sort": "stars", "order": "desc"}
+    params = {"q": query, "per_page": 100, "sort": "stars", "order": "desc"}
     resp = requests.get(GITHUB_API_URL, headers=headers, params=params, timeout=10)
 
     if resp.status_code == 403:
@@ -132,10 +132,11 @@ def search_github(query: str) -> dict:
     items = [
         {
             "name": item.get("full_name", ""),
-            "description": (item.get("description") or "")[:200],
+            "description": (item.get("description") or "")[:300],
             "stars": item.get("stargazers_count", 0),
             "url": item.get("html_url", ""),
             "language": item.get("language") or "",
+            "fork": item.get("fork", False),
         }
         for item in data.get("items", [])
     ]
@@ -146,62 +147,128 @@ def search_github(query: str) -> dict:
 # Scoring helpers
 # ---------------------------------------------------------------------------
 
-def compute_competition_risk(total_count: int) -> float:
-    """Map a GitHub repository count to a 0–1 competition risk score."""
-    return min(total_count / 100.0, 1.0)
+# Repos with description shorter than this are considered junk
+_JUNK_MIN_DESC_LEN = 20
+
+# match_score >= this threshold counts as a "true competitor"
+_HIGH_SIM_THRESHOLD = 3
+
+_STOP_WORDS = {
+    "a", "an", "the", "is", "for", "and", "or", "to", "of", "in",
+    "that", "with", "into", "from", "as", "at", "by", "on", "it",
+    "its", "be", "are", "was", "were", "will", "can", "has", "have",
+    "small", "large", "turns", "turn", "make", "makes", "automatically",
+    "auto", "using", "used", "uses", "build", "built", "based",
+}
 
 
-def compute_top_matches(idea: str, keywords: List[str], repos: List[dict], top_n: int = 10) -> List[dict]:
-    """Re-rank repos by similarity to the original idea and return the top N."""
-    stop_words = {
-        "a", "an", "the", "is", "for", "and", "or", "to", "of", "in",
-        "that", "with", "into", "from", "as", "at", "by", "on", "it",
-        "its", "be", "are", "was", "were", "will", "can", "has", "have",
-        "small", "large", "turns", "turn", "make", "makes", "automatically",
-        "auto", "using", "used", "uses", "build", "built", "based",
-    }
+def _is_junk_repo(repo: dict) -> bool:
+    """Return True if a repo should be discarded (no/trivial description or is a fork)."""
+    desc = (repo.get("description") or "").strip()
+    if len(desc) < _JUNK_MIN_DESC_LEN:
+        return True
+    if repo.get("fork", False):
+        return True
+    return False
 
-    def whole_word_match(word: str, text: str) -> bool:
-        return bool(re.search(r'\b' + re.escape(word) + r'\b', text))
 
+def _score_repo(idea_words: List[str], kw_lower: List[str], repo: dict) -> int:
+    """Score a single repo against the idea words and keywords.
+    
+    Scoring:
+      +3 per extracted keyword matched (whole-word) in name+description
+      +1 per significant idea word matched (whole-word)
+    """
+    text = (repo.get("name", "") + " " + (repo.get("description") or "")).lower()
+    score = 0
+    for kw in kw_lower:
+        if re.search(r'\b' + re.escape(kw) + r'\b', text):
+            score += 3
+    for word in idea_words:
+        if re.search(r'\b' + re.escape(word) + r'\b', text):
+            score += 1
+    return score
+
+
+def filter_score_repos(idea: str, keywords: List[str], repos: List[dict], display_n: int = 12) -> dict:
+    """Filter junk repos, score all remaining by similarity, return ranked results.
+    
+    Returns:
+      top_matches      – top `display_n` repos for UI display (with match_score)
+      high_sim_count   – number of repos scoring >= _HIGH_SIM_THRESHOLD (drives risk)
+      filtered_count   – total repos after junk removal
+      total_scored     – repos with any similarity score ≥ 1
+    """
+    # Build idea word list (de-duped, no stop words, length > 3)
     seen: set = set()
     idea_words: List[str] = []
     for w in idea.split():
         clean = w.strip(".,!?;:\"'()[]{}").lower()
-        if len(clean) > 3 and clean not in stop_words and clean not in seen:
+        if len(clean) > 3 and clean not in _STOP_WORDS and clean not in seen:
             seen.add(clean)
             idea_words.append(clean)
 
-    kw_lower = [k.lower() for k in keywords if k.lower() not in stop_words]
+    kw_lower = [k.lower() for k in keywords if k.lower() not in _STOP_WORDS]
 
+    # Step 1: remove junk repos
+    clean_repos = [r for r in repos if not _is_junk_repo(r)]
+    logger.info(f"GitHub: {len(repos)} fetched → {len(clean_repos)} after junk filter")
+
+    # Step 2: score all clean repos
     scored: List[dict] = []
-    for repo in repos:
-        text = (repo.get("name", "") + " " + (repo.get("description") or "")).lower()
-        score = 0
-        for kw in kw_lower:
-            if whole_word_match(kw, text):
-                score += 3
-        for word in idea_words:
-            if whole_word_match(word, text):
-                score += 1
-        if score >= 2:
-            scored.append({**repo, "match_score": score})
+    for repo in clean_repos:
+        s = _score_repo(idea_words, kw_lower, repo)
+        if s >= 1:
+            scored.append({**repo, "match_score": s})
 
-    scored.sort(key=lambda r: r["match_score"], reverse=True)
-    top_n = max(5, min(top_n, 10))
-    return scored[:top_n]
+    # Sort by score desc, then stars desc for tie-breaking
+    scored.sort(key=lambda r: (r["match_score"], r.get("stars", 0)), reverse=True)
+
+    # Step 3: cap at 100 after filtering (the "similar github" pool)
+    scored = scored[:100]
+
+    high_sim_count = sum(1 for r in scored if r["match_score"] >= _HIGH_SIM_THRESHOLD)
+    logger.info(
+        f"GitHub: {len(scored)} relevant repos, {high_sim_count} high-similarity (score ≥ {_HIGH_SIM_THRESHOLD})"
+    )
+
+    # Top N for display
+    display_n = max(5, min(display_n, 15))
+    if scored:
+        top_matches = scored[:display_n]
+    else:
+        # Fallback: top repos by stars when nothing matched
+        top_matches = sorted(clean_repos, key=lambda r: r.get("stars", 0), reverse=True)[:5]
+
+    return {
+        "top_matches": top_matches,
+        "high_sim_count": high_sim_count,
+        "filtered_count": len(clean_repos),
+        "total_scored": len(scored),
+    }
+
+
+def compute_competition_risk(high_sim_count: int) -> float:
+    """Map the number of highly-similar repos to a 0–1 competition risk score.
+    
+    Scale: 0 → 0%, 10 → 40%, 25 → 100%
+    """
+    return min(high_sim_count / 25.0, 1.0)
+
+
+def compute_top_matches(idea: str, keywords: List[str], repos: List[dict], top_n: int = 12) -> List[dict]:
+    """Convenience wrapper around filter_score_repos for backward compatibility."""
+    return filter_score_repos(idea, keywords, repos, display_n=top_n)["top_matches"]
 
 
 def compute_relevance(keywords: List[str], repos: List[dict]) -> float:
-    """Score how relevant the returned repos are to the keywords."""
+    """Score how relevant the returned repos are to the keywords (0–1)."""
     if not repos:
         return 0.0
-
     kw_lower = [k.lower() for k in keywords]
-    matches = 0
-    for repo in repos:
-        text = (repo.get("name", "") + " " + (repo.get("description") or "")).lower()
-        if any(kw in text for kw in kw_lower):
-            matches += 1
-
+    matches = sum(
+        1 for repo in repos
+        if any(kw in (repo.get("name", "") + " " + (repo.get("description") or "")).lower()
+               for kw in kw_lower)
+    )
     return matches / len(repos)

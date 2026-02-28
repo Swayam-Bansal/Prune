@@ -13,6 +13,7 @@ Implements a multi-stage feedback loop:
 The loop runs up to MAX_ITERATIONS times (default 3).
 """
 
+import asyncio
 import json
 import logging
 import time
@@ -35,9 +36,9 @@ from reddit_client import search_reddit, fetch_thread_comments
 logger = logging.getLogger(__name__)
 
 # ── Config ─────────────────────────────────────────────
-MAX_ITERATIONS = 3          # max feedback-loop cycles
-INITIAL_QUERIES = 6         # queries generated in round 1
-REFINEMENT_QUERIES = 4      # queries generated per refinement round
+MAX_ITERATIONS = 2          # max feedback-loop cycles
+INITIAL_QUERIES = 4         # queries generated in round 1
+REFINEMENT_QUERIES = 3      # queries generated per refinement round
 MIN_SIGNALS_PER_TYPE = 2    # minimum threads needed per signal type before we stop
 MODEL = "gpt-4o"            # model to use
 TEMPERATURE = 0.4           # low temp for structured output
@@ -118,38 +119,35 @@ async def generate_queries(
 # ─────────────────────────────────────────────────────────
 async def search_all_queries(queries: list[dict]) -> dict[str, list[dict]]:
     """
-    Run all search queries against Reddit.
+    Run all search queries against Reddit concurrently.
     Returns a dict mapping query_string -> list of threads.
     """
-    results = {}
-    for q in queries:
+    async def _search_and_enrich(q: dict) -> tuple[str, list[dict]]:
         query_str = q.get("query", "")
-        subreddits = q.get("subreddits", [])
         if not query_str:
-            continue
+            return query_str, []
 
         threads = await search_reddit(
             query=query_str,
-            subreddits=subreddits,
+            subreddits=q.get("subreddits", []),
             limit=10,
             sort="relevance",
             time_filter="all",
         )
 
-        # For top threads (high score), also fetch comments for richer signal
-        enriched_threads = []
-        for thread in threads:
+        async def _enrich(thread: dict) -> dict:
             if thread["num_comments"] >= 5 and thread["score"] >= 10:
-                comments = await fetch_thread_comments(thread["url"], limit=5)
-                thread["top_comments"] = comments
+                thread["top_comments"] = await fetch_thread_comments(thread["url"], limit=5)
             else:
                 thread["top_comments"] = []
-            enriched_threads.append(thread)
+            return thread
 
-        results[query_str] = enriched_threads
-        logger.info(f"Query '{query_str}' → {len(enriched_threads)} threads")
+        enriched = list(await asyncio.gather(*[_enrich(t) for t in threads]))
+        logger.info(f"Query '{query_str}' → {len(enriched)} threads")
+        return query_str, enriched
 
-    return results
+    pairs = await asyncio.gather(*[_search_and_enrich(q) for q in queries])
+    return dict(pairs)
 
 
 # ─────────────────────────────────────────────────────────
@@ -396,23 +394,23 @@ async def run_reddit_signal_engine(
         await status("searching", f"Searching Reddit with {len(queries)} queries...")
         search_results = await search_all_queries(queries)
 
-        # Step 3: Analyze each batch of threads
-        for q in queries:
+        # Step 3: Analyze all query batches concurrently
+        async def _analyze_one(q: dict) -> list[dict]:
             query_str = q.get("query", "")
-            intent = q.get("intent", "demand")
             threads = search_results.get(query_str, [])
-
             if not threads:
-                continue
-
-            all_queries_used.append(query_str)
+                return []
             await status("analyzing", f"Analyzing {len(threads)} threads for: '{query_str}'")
-
-            analyzed = await analyze_threads(
+            return await analyze_threads(
                 client, idea, problem, solution, product_specs,
-                query_str, intent, threads,
+                query_str, q.get("intent", "demand"), threads,
             )
-            all_signals.extend(analyzed)
+
+        analysis_batches = await asyncio.gather(*[_analyze_one(q) for q in queries])
+        for q, analyzed in zip(queries, analysis_batches):
+            if analyzed:
+                all_queries_used.append(q.get("query", ""))
+                all_signals.extend(analyzed)
 
         # Step 4: Evaluate coverage
         coverage = evaluate_coverage(all_signals)
