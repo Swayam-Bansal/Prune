@@ -1,9 +1,16 @@
 """
-PreMortem API — Agentic Reddit Signal Engine
-=============================================
-FastAPI server with:
-  - POST /analyze         → full synchronous analysis
-  - POST /analyze/stream  → SSE streaming with live status updates
+Prune / PreMortem API
+======================
+Unified FastAPI server combining:
+  • GitHub competition signals   (from main branch)
+  • Agentic Reddit signal engine (from reddit-search branch)
+
+Routes:
+  POST /github/search          → GitHub competition search
+  POST /analyze                → Full analysis (GitHub + Reddit)
+  POST /analyze/stream         → SSE streaming Reddit analysis
+  POST /reddit/analyze         → Reddit-only analysis
+  GET  /health
 
 Run with:
   uvicorn main:app --reload --port 8000
@@ -19,8 +26,17 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
 from engine import run_reddit_signal_engine
+from github_client import (
+    build_github_query,
+    compute_competition_risk,
+    compute_relevance,
+    compute_top_matches,
+    extract_keywords,
+    search_github,
+)
 from models import AnalysisResponse, Scores, SignalThread, StartupInput
 
 load_dotenv()
@@ -32,19 +48,27 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="PreMortem — Reddit Signal Engine",
-    description="Agentic market research using Reddit signals + ChatGPT",
+    title="Prune — PreMortem Market Signal Engine",
+    description="GitHub competition signals + Agentic Reddit signal analysis",
     version="1.0.0",
 )
 
-# CORS — allow the frontend
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+class IdeaRequest(BaseModel):
+    idea: str
 
 
 def get_openai_key() -> str:
@@ -57,12 +81,36 @@ def get_openai_key() -> str:
     return key
 
 
-# ─────────────────────────────────────────────────────────
-# POST /analyze — Synchronous full analysis
-# ─────────────────────────────────────────────────────────
-@app.post("/analyze", response_model=AnalysisResponse)
-async def analyze(input_data: StartupInput):
-    """Run the full agentic Reddit signal engine and return the complete result."""
+# ═══════════════════════════════════════════════════════════
+# GITHUB ROUTES (from main branch)
+# ═══════════════════════════════════════════════════════════
+
+@app.post("/github/search")
+def github_search(body: IdeaRequest):
+    """Search GitHub directly for the raw idea string."""
+    keywords = extract_keywords(body.idea)
+    query = build_github_query(keywords)
+    result = search_github(query)
+    competition_risk = compute_competition_risk(result["total_count"])
+    relevance_score = compute_relevance(keywords, result["items"])
+    top_matches = compute_top_matches(body.idea, keywords, result["items"])
+    return {
+        "query": query,
+        "keywords": keywords,
+        "total_count": result["total_count"],
+        "competition_risk": competition_risk,
+        "relevance_score": relevance_score,
+        "repositories": top_matches,
+    }
+
+
+# ═══════════════════════════════════════════════════════════
+# REDDIT ROUTES (from reddit-search branch)
+# ═══════════════════════════════════════════════════════════
+
+@app.post("/reddit/analyze", response_model=AnalysisResponse)
+async def reddit_analyze(input_data: StartupInput):
+    """Run Reddit-only agentic signal engine."""
     api_key = get_openai_key()
 
     try:
@@ -74,10 +122,9 @@ async def analyze(input_data: StartupInput):
             product_specs=input_data.product_specs,
         )
     except Exception as e:
-        logger.exception("Engine failed")
+        logger.exception("Reddit engine failed")
         raise HTTPException(status_code=500, detail=str(e))
 
-    # Build typed response
     threads = [
         SignalThread(**{k: v for k, v in t.items()
                      if k in SignalThread.model_fields})
@@ -98,15 +145,77 @@ async def analyze(input_data: StartupInput):
     )
 
 
-# ─────────────────────────────────────────────────────────
-# POST /analyze/stream — SSE streaming with status updates
-# ─────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+# COMBINED /analyze — GitHub + Reddit together
+# ═══════════════════════════════════════════════════════════
+
+@app.post("/analyze")
+async def analyze(input_data: StartupInput):
+    """Full analysis: GitHub competition + Reddit signals combined."""
+    api_key = get_openai_key()
+
+    # --- GitHub signals (sync, fast) ---
+    keywords = extract_keywords(input_data.idea)
+    query = build_github_query(keywords)
+    github_result = search_github(query)
+    competition_risk = compute_competition_risk(github_result["total_count"])
+    relevance_score = compute_relevance(keywords, github_result["items"])
+    top_matches = compute_top_matches(input_data.idea, keywords, github_result["items"])
+
+    github_data = {
+        "query": query,
+        "keywords": keywords,
+        "total_count": github_result["total_count"],
+        "competition_risk": competition_risk,
+        "relevance_score": relevance_score,
+        "repositories": top_matches,
+    }
+
+    # --- Reddit signals (async, agentic) ---
+    try:
+        reddit_result = await run_reddit_signal_engine(
+            openai_api_key=api_key,
+            idea=input_data.idea,
+            problem=input_data.problem,
+            solution=input_data.solution,
+            product_specs=input_data.product_specs,
+        )
+    except Exception as e:
+        logger.exception("Reddit engine failed during combined analysis")
+        reddit_result = {"report": "", "scores": {}, "threads": [], "iterations": 0,
+                         "queries_used": [], "coverage": {}, "elapsed_seconds": 0.0}
+
+    threads = [
+        SignalThread(**{k: v for k, v in t.items()
+                     if k in SignalThread.model_fields})
+        for t in reddit_result.get("threads", [])
+    ]
+    scores_raw = reddit_result.get("scores", {})
+    scores = Scores(**{k: v for k, v in scores_raw.items()
+                    if k in Scores.model_fields})
+
+    return {
+        "idea": input_data.idea,
+        "github": github_data,
+        "reddit": AnalysisResponse(
+            report=reddit_result.get("report", ""),
+            scores=scores,
+            threads=threads,
+            iterations=reddit_result.get("iterations", 0),
+            queries_used=reddit_result.get("queries_used", []),
+            coverage=reddit_result.get("coverage", {}),
+            elapsed_seconds=reddit_result.get("elapsed_seconds", 0.0),
+        ),
+    }
+
+
+# ═══════════════════════════════════════════════════════════
+# SSE STREAMING — Reddit analysis with live status updates
+# ═══════════════════════════════════════════════════════════
+
 @app.post("/analyze/stream")
 async def analyze_stream(input_data: StartupInput):
-    """
-    Run the engine with Server-Sent Events.
-    Each event is a JSON status update, and the final event contains the full result.
-    """
+    """SSE streaming: each event is a status update, final event has the result."""
     api_key = get_openai_key()
 
     async def event_generator() -> AsyncGenerator[str, None]:
@@ -130,9 +239,8 @@ async def analyze_stream(input_data: StartupInput):
                 logger.exception("Engine failed during streaming")
                 await status_queue.put({"type": "error", "detail": str(e)})
             finally:
-                await status_queue.put(None)  # sentinel
+                await status_queue.put(None)
 
-        # Start engine in background
         task = asyncio.create_task(run_engine())
 
         while True:
@@ -141,24 +249,22 @@ async def analyze_stream(input_data: StartupInput):
                 break
             yield f"data: {json.dumps(item)}\n\n"
 
-        await task  # ensure it's done
+        await task
 
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-        },
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )
 
 
-# ─────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
 # Health check
-# ─────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+
 @app.get("/health")
 async def health():
-    return {"status": "ok", "engine": "PreMortem Reddit Signal Engine v1.0"}
+    return {"status": "ok", "engine": "Prune PreMortem v1.0"}
 
 
 if __name__ == "__main__":
